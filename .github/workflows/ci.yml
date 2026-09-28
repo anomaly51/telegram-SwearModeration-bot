@@ -1,44 +1,48 @@
-name: CI/CD Pipeline
-
-on:
+name: CI and environments
+'on':
   push:
     branches:
-      - master
-      - main
-
+    - main
+    - dev
+  pull_request:
+    branches:
+    - main
+    - dev
+  workflow_dispatch: null
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+concurrency:
+  group: ci-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
-  # ЭТАП 1: ТАМОЖНЯ (CI)
   test-and-lint:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
-      - name: 📥 Клонирование репозитория
-        uses: actions/checkout@v4
-
-      - name: 🐍 Установка Python 3.12
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: 📦 Установка Poetry
-        run: pip install poetry
-
-      - name: 🛠️ Установка зависимостей
-        run: poetry install --no-root
-
-      - name: 🧹 Проверка линтером (Ruff)
-        run: poetry run ruff check .
-
-      - name: 🧪 Запуск тестов (Pytest)
-        env:
-          PYTHONPATH: .
-        run: poetry run python -m pytest tests/ -v
-
-  deploy:
-    needs: test-and-lint
-    runs-on: self-hosted
-    steps:
-      - name: 🚀 Перезапуск бота
-        run: |
-          cd /home/nekoneki/TgBotBadWordsCheker
-          git pull
-          docker compose up -d --build
+    - name: "\U0001F4E5 \u041A\u043B\u043E\u043D\u0438\u0440\u043E\u0432\u0430\u043D\u0438\u0435 \u0440\u0435\u043F\u043E\u0437\
+        \u0438\u0442\u043E\u0440\u0438\u044F"
+      uses: actions/checkout@v4
+    - name: "\U0001F40D \u0423\u0441\u0442\u0430\u043D\u043E\u0432\u043A\u0430 Python 3.12"
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: "\U0001F4E6 \u0423\u0441\u0442\u0430\u043D\u043E\u0432\u043A\u0430 Poetry"
+      run: pip install poetry
+    - name: "\U0001F6E0\uFE0F \u0423\u0441\u0442\u0430\u043D\u043E\u0432\u043A\u0430 \u0437\u0430\u0432\u0438\u0441\u0438\u043C\
+        \u043E\u0441\u0442\u0435\u0439"
+      run: poetry install --no-root
+    - name: "\U0001F9F9 \u041F\u0440\u043E\u0432\u0435\u0440\u043A\u0430 \u043B\u0438\u043D\u0442\u0435\u0440\u043E\u043C\
+        \ (Ruff)"
+      run: poetry run ruff check .
+    - name: "\U0001F9EA \u0417\u0430\u043F\u0443\u0441\u043A \u0442\u0435\u0441\u0442\u043E\u0432 (Pytest)"
+      env:
+        PYTHONPATH: .
+      run: poetry run python -m pytest tests/ -v
+  release:
+    uses: anomaly51/general-1-argocd/.github/workflows/build-and-stage.yaml@main
+    with:
+      application: telegram-swearmoderation-bot
+      components: '[{"key":"image"}]'
+    needs:
+    - test-and-lint
