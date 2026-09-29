@@ -1,13 +1,7 @@
 # Deployments
 
-Code is synchronized from `Gamubells/telegram-SwearModeration-bot`, branch `master`,
-into this repository's `main` by **Sync upstream** (every 5 minutes, or Run workflow).
-GitHub may delay scheduled runs. The sync creates a normal merge commit and keeps
-our `.github/` workflows and this deployment guide. Application-code conflicts fail
-for manual resolution; the sync never force-pushes. CI is explicitly dispatched after
-the merge because a push made with `GITHUB_TOKEN` does not trigger push workflows.
-The developer repository is read-only to our GitHub account, so its webhook cannot
-be configured here. Production continues to require **Promote production**.
+This repository is the deployment source. Changes from another repository must
+be merged here explicitly; there is no scheduled upstream synchronization.
 
 Push `dev` to build and update `telegram-swearmoderation-bot/values/dev.yaml` in `anomaly51/general-1-argocd`.
 Push `main` to build and update `staging.yaml`. Argo CD deploys these environments automatically.

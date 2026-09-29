@@ -35,8 +35,6 @@ jobs:
     - name: "\U0001F9F9 \u041F\u0440\u043E\u0432\u0435\u0440\u043A\u0430 \u043B\u0438\u043D\u0442\u0435\u0440\u043E\u043C\
         \ (Ruff)"
       run: poetry run ruff check .
-    - name: Verify upstream synchronization guards
-      run: python -m unittest discover -s .github/tests -v
     - name: "\U0001F9EA \u0417\u0430\u043F\u0443\u0441\u043A \u0442\u0435\u0441\u0442\u043E\u0432 (Pytest)"
       env:
         PYTHONPATH: .
