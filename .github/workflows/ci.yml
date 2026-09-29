@@ -1,21 +1,18 @@
-name: CI and environments
+name: CI and production
 'on':
   push:
     branches:
     - main
-    - dev
   pull_request:
     branches:
     - main
-    - dev
-  workflow_dispatch: null
 permissions:
   contents: read
   packages: write
   id-token: write
 concurrency:
   group: ci-${{ github.repository }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 jobs:
   test-and-lint:
     runs-on: ubuntu-latest
