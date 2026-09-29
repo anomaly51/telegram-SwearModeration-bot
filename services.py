@@ -5,12 +5,9 @@ from bad_words_list import EXACT_WORDS, LEETSPEAK_MAP, NEUTRAL_WORDS, ROOT_WORDS
 
 
 WORD_PATTERN = re.compile(r"[а-яёa-z0-9]+")
-NON_WORD_CHAR_PATTERN = re.compile(r"[^а-яёa-z0-9]")
 DUPLICATE_PATTERN = re.compile(r"(.)\1+")
-OBFUSCATED_WORD_PATTERN = re.compile(
-    r"(?<![а-яёa-z0-9])(?:[а-яёa-z0-9]+[^а-яёa-z0-9\s]+)+"
-    r"[а-яёa-z0-9]+(?![а-яёa-z0-9])"
-)
+# Commas and sentence punctuation delimit separate words; inner dots/dashes join letters.
+OBFUSCATED_WORD_PATTERN = re.compile(r"[а-яёa-z0-9]+(?:[._*\-\u200b\u200c\u200d]+[а-яёa-z0-9]+)+")
 MAX_RECORDED_WORD_LENGTH = 100
 
 
@@ -125,6 +122,49 @@ def _append_classified_word(word: str, swear_words: list[str], neutral_words: li
         neutral_words.append(_limit_recorded_word(neutral_word))
 
 
+def _obfuscated_word_choices(parts, classification_cache):
+    recognized = [any(_classify_word(part)) for part in parts]
+    # Prefer multiple complete words over a single over-broad root match.
+    scores = [(0, 0)] * (len(parts) + 1)
+    choices = {}
+    for start in range(len(parts) - 1, -1, -1):
+        scores[start] = scores[start + 1]
+        joined = ""
+        for end in range(start, min(len(parts), start + 64)):
+            if recognized[end]:
+                break
+            joined += parts[end]
+            if end == start:
+                continue
+            if joined not in classification_cache:
+                classification_cache[joined] = _classify_word(joined)
+            found = classification_cache[joined]
+            if not any(found):
+                continue
+            score = (scores[end + 1][0] + 1, scores[end + 1][1] + len(joined))
+            if score > scores[start]:
+                scores[start] = score
+                choices[start] = (end + 1, found)
+    return choices
+
+
+def _append_obfuscated_words(text, swear_words, neutral_words):
+    classification_cache = {}
+    for match in OBFUSCATED_WORD_PATTERN.finditer(text):
+        parts = WORD_PATTERN.findall(match.group(0))
+        choices = _obfuscated_word_choices(parts, classification_cache)
+        index = 0
+        while index < len(parts):
+            if index not in choices:
+                index += 1
+                continue
+            index, (swear, neutral) = choices[index]
+            if swear:
+                swear_words.append(_limit_recorded_word(swear))
+            elif neutral:
+                neutral_words.append(_limit_recorded_word(neutral))
+
+
 def check_text_for_swears_detailed(text: str) -> SwearCheckResult:
     if not text:
         return SwearCheckResult(0, [], 0, [])
@@ -142,7 +182,6 @@ def check_text_for_swears_detailed(text: str) -> SwearCheckResult:
         text = pattern.sub(" ", text)
 
     words = WORD_PATTERN.findall(text)
-    obfuscated_matches = list(OBFUSCATED_WORD_PATTERN.finditer(text))
 
     swear_words = []
     neutral_words = []
@@ -153,13 +192,7 @@ def check_text_for_swears_detailed(text: str) -> SwearCheckResult:
     for word in words:
         _append_classified_word(word, swear_words, neutral_words)
 
-    for match in obfuscated_matches:
-        parts = WORD_PATTERN.findall(match.group(0))
-        if any(any(_classify_word(part)) for part in parts):
-            continue
-
-        word = NON_WORD_CHAR_PATTERN.sub("", match.group(0))
-        _append_classified_word(word, swear_words, neutral_words)
+    _append_obfuscated_words(text, swear_words, neutral_words)
 
     return SwearCheckResult(
         swear_count=len(swear_words),

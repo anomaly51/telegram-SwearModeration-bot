@@ -22,6 +22,7 @@ htmlcov/
 
 # Packaging and build outputs
 build/
+.build-info.json
 dist/
 *.egg-info/
 

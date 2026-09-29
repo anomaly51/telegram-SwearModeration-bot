@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime
 from os import getenv
 from zoneinfo import ZoneInfo
 
@@ -8,14 +9,16 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 from loguru import logger
 from prometheus_client import start_http_server
+from sqlalchemy import text
 
+from bot_runtime import PollingHealthMiddleware, wait_for_instance
 from database.db import engine
 from database.models import Base
 from database.orm_query import BadWordsRepository
 from handlers.user_handler import router
 from logger_config import setup_logging
 from metrics import ACTIVE_SUBSCRIPTIONS
-from scheduler import send_daily_report
+from scheduler import send_scheduled_reports
 
 
 load_dotenv()
@@ -63,6 +66,7 @@ async def on_startup(bot):
             logger.info("✓ База данных очищена")
 
         async with engine.begin() as conn:
+            await conn.execute(text("SET LOCAL lock_timeout = '2s'"))
             await conn.run_sync(Base.metadata.create_all)
         await BadWordsRepository.ensure_daily_swears_integrity()
 
@@ -92,28 +96,49 @@ async def on_shutdown(bot):
 
 
 async def main() -> None:
+    bot.session.middleware(PollingHealthMiddleware())
+    try:
+        await wait_for_instance(engine, bot.id, run_bot)
+    finally:
+        await bot.session.close()
+        await engine.dispose()
+
+
+async def run_bot() -> None:
     logger.info("📱 Запуск бота...")
-    await bot.delete_webhook(drop_pending_updates=True)
+    await bot.delete_webhook(drop_pending_updates=False)
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
 
     scheduler = AsyncIOScheduler(timezone=ZoneInfo("Europe/Kyiv"))
-    try:
-        scheduler.add_job(send_daily_report, "cron", hour=23, minute=1, args=[bot])
+
+    async def start_scheduler(bot):
         scheduler.add_job(
-            BadWordsRepository.clear_old_logs, trigger="cron", hour=3, minute=0, args=[7]
+            send_scheduled_reports,
+            "interval",
+            minutes=5,
+            args=[bot],
+            next_run_time=datetime.now(ZoneInfo("Europe/Kyiv")),
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=300,
         )
-
-        start_http_server(8000)
-        logger.info("📊 Prometheus метрики доступны на порту 8000")
-
+        scheduler.add_job(
+            BadWordsRepository.clear_old_logs,
+            "cron",
+            hour=3,
+            minute=0,
+            args=[90],
+        )
         scheduler.start()
-        logger.info("✓ Планировщик запущен")
-        logger.info("✅ Бот готов к приему сообщений")
+
+    dp.startup.register(start_scheduler)
+    try:
+        start_http_server(8000)
         await dp.start_polling(bot, allowed_updates=ALLOWED_UPDATES)
-    except Exception as e:
-        logger.error(f"❌ Критическая ошибка: {e}")
-        raise
+    finally:
+        if scheduler.running:
+            scheduler.shutdown(wait=False)
 
 
 if __name__ == "__main__":

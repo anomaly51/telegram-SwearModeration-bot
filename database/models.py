@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import BigInteger, Date, DateTime, Integer, String, UniqueConstraint
+from sqlalchemy import JSON, BigInteger, Date, DateTime, Integer, String, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -68,6 +68,7 @@ class SwearLog(Base):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     chat_id: Mapped[int] = mapped_column(BigInteger)
     user_id: Mapped[int] = mapped_column(BigInteger)
+    message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     username: Mapped[str] = mapped_column(String(255), nullable=True)
     word: Mapped[str] = mapped_column(String(255))
     category: Mapped[str] = mapped_column(String(32), default="swear")
@@ -95,3 +96,28 @@ class BotChat(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(ZoneInfo("Europe/Kyiv"))
     )
+
+
+class ProcessedMessage(Base):
+    """Latest counted version; stores word matches, never the original message text."""
+
+    __tablename__ = "processed_messages"
+
+    chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    message_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    user_id: Mapped[int] = mapped_column(BigInteger)
+    date: Mapped[date] = mapped_column(Date)
+    version: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    update_id: Mapped[int] = mapped_column(BigInteger, default=0)
+    swear_words: Mapped[list[str]] = mapped_column(JSON)
+    neutral_words: Mapped[list[str]] = mapped_column(JSON)
+
+
+class ReportDelivery(Base):
+    __tablename__ = "report_deliveries"
+
+    chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    kind: Mapped[str] = mapped_column(String(16), primary_key=True)
+    period_start: Mapped[date] = mapped_column(Date, primary_key=True)
+    chunks: Mapped[list[str]] = mapped_column(JSON)
+    next_chunk: Mapped[int] = mapped_column(Integer, default=0)

@@ -1,17 +1,20 @@
 import html
-from datetime import datetime
+from datetime import datetime, timedelta
 from hashlib import sha256
 from random import Random
 from types import SimpleNamespace
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message
+from aiogram.types import ErrorEvent, Message, Update
 from loguru import logger
 
-from database.orm_query import TZ_KYIV, BadWordsRepository
+from database.db import settings
+from database.orm_query import TZ_KYIV, BadWordsRepository, RepositoryError
 from metrics import ACTIVE_SUBSCRIPTIONS, MESSAGES_TOTAL, SWEARS_TOTAL
+from scheduler import format_monthly_report, format_weekly_report, split_telegram_message
 from services import check_text_for_swears_detailed
+from version_info import INSTANCE_NAME, PROCESS_STARTED_AT, RUNNING_BUILD, format_admin_build_report
 
 
 router = Router()
@@ -59,7 +62,7 @@ def parse_say_command(text: str | None) -> tuple[int | str | None, str]:
     if not message_text:
         return None, ""
 
-    if raw_chat_id.lstrip("-").isdigit():
+    if raw_chat_id.removeprefix("-").isascii() and raw_chat_id.removeprefix("-").isdigit():
         return int(raw_chat_id), message_text
 
     if raw_chat_id.startswith("@") and len(raw_chat_id) > 1:
@@ -215,7 +218,7 @@ async def announce_rare_find_if_needed(message: Message, found_words: list[str])
     if not message.from_user or message.chat.type == "private":
         return
 
-    now = datetime.now(TZ_KYIV)
+    now = message.date.astimezone(TZ_KYIV)
     rare_words = get_month_rare_words(message.chat.id, now.year, now.month)
     found_rare_words = [word for word in rare_words if word in found_words]
 
@@ -244,11 +247,14 @@ async def _remember_chat(message: Message) -> None:
     if message.chat.type == "private":
         return
 
-    await BadWordsRepository.upsert_bot_chat(
-        chat_id=message.chat.id,
-        title=message.chat.title,
-        chat_type=message.chat.type,
-    )
+    try:
+        await BadWordsRepository.upsert_bot_chat(
+            chat_id=message.chat.id,
+            title=message.chat.title,
+            chat_type=message.chat.type,
+        )
+    except RepositoryError:
+        logger.exception("Не удалось сохранить название чата")
 
 
 async def _is_user_chat_admin(message: Message, chat_id: int | str) -> bool:
@@ -285,6 +291,18 @@ async def start_command_handler(message: Message):
     await message.answer("Добро пожаловать в бот, который будет считать ваши ругательства")
 
 
+@router.message(Command("admin_swear_check"))
+async def admin_swear_check_handler(message: Message):
+    user = message.from_user
+    if not user or user.is_bot or message.sender_chat or str(user.id) != settings.ADMIN_ID.strip():
+        await message.answer("⛔ Команда доступна только владельцу бота.")
+        return
+    await message.answer(
+        format_admin_build_report(RUNNING_BUILD, PROCESS_STARTED_AT, INSTANCE_NAME),
+        parse_mode="HTML",
+    )
+
+
 @router.message(Command("subscribe_swears"))
 async def subscribe_command_handler(message: Message):
     await _remember_chat(message)
@@ -297,7 +315,8 @@ async def subscribe_command_handler(message: Message):
     if success:
         ACTIVE_SUBSCRIPTIONS.inc()
         await message.answer(
-            "✅ Отлично! Этот чат подписан на ежедневные отчеты (в 23:01 по Киеву)."
+            "✅ Этот чат подписан на отчеты: ежедневно, по понедельникам за неделю "
+            "и первого числа за месяц. Отправка после 00:05 по Киеву."
         )
     else:
         await message.answer("ℹ️ Этот чат уже подписан на рассылку.")
@@ -448,6 +467,8 @@ async def about_command_handler(message: Message):
         "• Персональная статистика и логирование.\n\n"
         "<b>Управление:</b>\n"
         "▫️ <code>/count_swears</code> — посмотреть количество своих матов за текущий день.\n"
+        "▫️ <code>/week_swears</code> — статистика чата за текущую неделю.\n"
+        "▫️ <code>/month_swears</code> — статистика чата за текущий месяц.\n"
         "▫️ <code>/profile_swears</code> — посмотреть свой матный профиль за месяц.\n"
         "▫️ <code>/logs_swears</code> — запросить детализацию (время и текст найденных ругательств)."
         "\n"
@@ -502,62 +523,62 @@ async def logs_command_handler(message: Message):
     await message.answer(text, parse_mode="HTML")
 
 
-@router.message(F.text)
-async def bad_words_handler(message: Message):
+@router.message(Command("week_swears", "month_swears"))
+async def period_command_handler(message: Message):
+    today = datetime.now(TZ_KYIV).date()
+    command = (message.text or "").split()[0].split("@")[0]
+    start = (
+        today.replace(day=1)
+        if command == "/month_swears"
+        else (today - timedelta(days=today.weekday()))
+    )
+    records = await BadWordsRepository.get_all_for_period(
+        message.chat.id, start, today + timedelta(days=1)
+    )
+    report = (
+        format_monthly_report(records, today.year, today.month)
+        if command == "/month_swears"
+        else format_weekly_report(records, start, today + timedelta(days=1))
+    )
+    for chunk in split_telegram_message(report):
+        await message.answer(chunk)
+
+
+@router.error()
+async def repository_error_handler(event: ErrorEvent):
+    if not isinstance(event.exception, RepositoryError):
+        raise event.exception
+    logger.opt(exception=event.exception).error("Ошибка базы данных при обработке сообщения")
+    message = event.update.message or event.update.edited_message
+    if message and message.text and message.text.startswith("/"):
+        await message.answer("⚠️ База данных временно недоступна. Попробуй ещё раз позже.")
+    return True
+
+
+@router.edited_message()
+@router.message(F.text | F.caption)
+async def bad_words_handler(message: Message, event_update: Update | None = None):
+    if not message.from_user or message.from_user.is_bot or message.sender_chat:
+        return
     MESSAGES_TOTAL.inc()
     await _remember_chat(message)
-
-    if not message.from_user:
-        logger.info("message ignored: from_user is missing")
-        return
-
-    logger.info(
-        f"received text message: chat_id={message.chat.id}, user_id={message.from_user.id}, "
-        f"length={len(message.text or '')}, bot={message.from_user.is_bot}"
-    )
-
-    if message.from_user.is_bot or not message.text or message.text.startswith("/"):
-        logger.info(
-            f"message ignored: bot={message.from_user.is_bot}, text_exists={bool(message.text)}, "
-            f"is_command={message.text.startswith('/') if message.text else False}"
-        )
-        return
-
-    await BadWordsRepository.increment_message_count(
+    content = message.text or message.caption or ""
+    swear_check = check_text_for_swears_detailed(content)
+    version = message.edit_date or message.date
+    if isinstance(version, int):
+        version = datetime.fromtimestamp(version, TZ_KYIV)
+    changed = await BadWordsRepository.record_message(
         chat_id=message.chat.id,
+        message_id=message.message_id,
         user_id=message.from_user.id,
         username=message.from_user.full_name,
-        date=datetime.now(TZ_KYIV).date(),
+        timestamp=message.date,
+        version=version,
+        swear_words=swear_check.swear_words,
+        neutral_words=swear_check.neutral_words,
+        edited=message.edit_date is not None,
+        update_id=event_update.update_id if event_update else 0,
     )
-
-    swear_check = check_text_for_swears_detailed(message.text)
-
-    if not swear_check.swear_count and not swear_check.neutral_count:
-        return
-
-    if swear_check.swear_count:
+    if changed:
         SWEARS_TOTAL.inc(swear_check.swear_count)
-
-    logger.info(
-        f"Найдены ругательства: chat_id={message.chat.id}, user_id={message.from_user.id}, "
-        f"маты={swear_check.swear_count}, нейтральные={swear_check.neutral_count}"
-    )
-    try:
-        await BadWordsRepository.add_swear(
-            chat_id=message.chat.id,
-            user_id=message.from_user.id,
-            username=message.from_user.full_name,
-            swears=swear_check.swear_count,
-            date=datetime.now(TZ_KYIV).date(),
-            found_words=swear_check.swear_words,
-            neutral_count=swear_check.neutral_count,
-            neutral_words=swear_check.neutral_words,
-        )
-        logger.info(
-            f"✓ Добавлено {swear_check.swear_count} матов и "
-            f"{swear_check.neutral_count} нейтральных ругательств в БД: "
-            f"chat_id={message.chat.id}, user_id={message.from_user.id}"
-        )
         await announce_rare_find_if_needed(message, swear_check.swear_words)
-    except Exception as e:
-        logger.error(f"✗ Ошибка добавления ругательства: {e}")

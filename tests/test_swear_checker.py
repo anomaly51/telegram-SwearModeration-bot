@@ -13,6 +13,44 @@ def test_clean_text():
     assert not contains_bad_word("Привет! Как твои дела сегодня?")
 
 
+@pytest.mark.parametrize(
+    "text,count",
+    [
+        ("привет,с.у.к.а", 1),
+        ("сука,п-и-д-о-р", 2),
+        ("с.у.к.а,п-и-д-о-р", 2),
+        ("привет.с.у.к.а", 1),
+        ("с.у.к.а!п-и-д-о-р", 2),
+        ("п-и-д-о-р.с.у.к.а", 2),
+    ],
+)
+def test_obfuscated_words_next_to_punctuation(text, count):
+    assert check_text_for_swears(text)[0] == count
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "долбить стену",
+        "долбануть молотком",
+        "долбим стену",
+        "хачапури",
+        "требуется учеба",
+        "подсвинтили винтик",
+        "свинцовые гири",
+    ],
+)
+def test_safe_words_do_not_match_broad_roots(text):
+    result = check_text_for_swears_detailed(text)
+    assert result.swear_count == result.neutral_count == 0
+
+
+def test_chat_vocabulary_categories():
+    result = check_text_for_swears_detailed("мудло мрази гондоны ёбнутый подсвинок свинтус")
+    assert result.swear_count == 4
+    assert result.neutral_words == ["подсвинок", "свинтус"]
+
+
 def test_exact_bad_word():
     assert contains_bad_word("Ну ты и сука")
 

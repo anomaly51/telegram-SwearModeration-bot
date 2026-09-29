@@ -1,8 +1,8 @@
-import asyncio
 from datetime import date
 from types import SimpleNamespace
 
 from scheduler import (
+    completed_periods,
     format_daily_report,
     format_monthly_report,
     format_percent_delta,
@@ -11,34 +11,20 @@ from scheduler import (
 )
 
 
-def test_daily_report_failure_does_not_block_other_chats(monkeypatch):
-    import scheduler
+def test_closed_periods_on_year_boundary():
+    assert completed_periods(date(2026, 1, 1)) == [
+        ("daily", date(2025, 12, 31), date(2026, 1, 1)),
+        ("weekly", date(2025, 12, 22), date(2025, 12, 29)),
+        ("monthly", date(2025, 12, 1), date(2026, 1, 1)),
+    ]
 
-    class Repository:
-        @staticmethod
-        async def get_all_active_chats():
-            return [1, 2]
 
-        @staticmethod
-        async def get_all_for_date(*, chat_id, date):
-            return []
-
-    class Bot:
-        def __init__(self):
-            self.attempted_chats = []
-
-        async def send_message(self, chat_id, text):
-            self.attempted_chats.append(chat_id)
-            if chat_id == 1:
-                raise RuntimeError("chat unavailable")
-
-    bot = Bot()
-    monkeypatch.setattr(scheduler, "BadWordsRepository", Repository)
-    monkeypatch.setattr(scheduler, "is_last_day_of_month", lambda current_date: False)
-
-    asyncio.run(scheduler.send_daily_report(bot))
-
-    assert bot.attempted_chats == [1, 2]
+def test_closed_week_is_monday_through_sunday():
+    assert completed_periods(date(2026, 9, 28))[1] == (
+        "weekly",
+        date(2026, 9, 21),
+        date(2026, 9, 28),
+    )
 
 
 def test_daily_report_is_sorted_by_swear_count_descending():

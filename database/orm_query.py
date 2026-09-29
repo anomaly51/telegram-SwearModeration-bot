@@ -4,6 +4,7 @@ from zoneinfo import ZoneInfo
 
 from loguru import logger
 from sqlalchemy import delete, func, select, text
+from sqlalchemy.dialects.postgresql import insert
 
 from database.db import async_session_maker
 from database.models import (
@@ -11,6 +12,7 @@ from database.models import (
     BotChat,
     DailyMessages,
     MonthlyRareWordDiscovery,
+    ProcessedMessage,
     ReportChat,
     SwearLog,
 )
@@ -18,6 +20,10 @@ from database.models import (
 
 TZ_KYIV = ZoneInfo("Europe/Kyiv")
 MAX_DB_TEXT_LENGTH = 255
+
+
+class RepositoryError(RuntimeError):
+    """Storage failed; callers must not interpret this as empty statistics."""
 
 
 def get_month_bounds(year: int, month: int) -> tuple[date, date]:
@@ -39,9 +45,156 @@ def get_previous_month(year: int, month: int) -> tuple[int, int]:
 
 class BadWordsRepository:
     @classmethod
+    async def record_message(
+        cls,
+        *,
+        chat_id,
+        message_id,
+        user_id,
+        username,
+        timestamp,
+        version,
+        swear_words,
+        neutral_words,
+        edited=False,
+        update_id=0,
+    ) -> bool:
+        """Atomically apply a new message or the delta of an edit; ignore replays."""
+        message_date = timestamp.astimezone(TZ_KYIV).date()
+        async with async_session_maker() as session:
+            try:
+                await session.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+                    {"key": f"message:{chat_id}:{message_id}"},
+                )
+                previous = await session.get(ProcessedMessage, (chat_id, message_id))
+                if previous is None and edited:
+                    # Legacy messages have no baseline; recounting would inflate old totals.
+                    return False
+                if previous and (
+                    version < previous.version
+                    or (version == previous.version and update_id <= previous.update_id)
+                ):
+                    return False
+                old_swears = len(previous.swear_words) if previous else 0
+                old_neutral = len(previous.neutral_words) if previous else 0
+                if previous:
+                    message_date = previous.date
+                    user_id = previous.user_id
+                else:
+                    message_stmt = insert(DailyMessages).values(
+                        chat_id=chat_id,
+                        user_id=user_id,
+                        username=username,
+                        date=message_date,
+                        message_count=1,
+                    )
+                    await session.execute(
+                        message_stmt.on_conflict_do_update(
+                            index_elements=["chat_id", "user_id", "date"],
+                            set_={
+                                "message_count": DailyMessages.message_count + 1,
+                                "username": username,
+                            },
+                        )
+                    )
+                swear_delta = len(swear_words) - old_swears
+                neutral_delta = len(neutral_words) - old_neutral
+                if swear_delta or neutral_delta:
+                    stmt = insert(BadWords).values(
+                        chat_id=chat_id,
+                        user_id=user_id,
+                        username=username,
+                        date=message_date,
+                        badwords_count=swear_delta,
+                        neutral_count=neutral_delta,
+                    )
+                    await session.execute(
+                        stmt.on_conflict_do_update(
+                            index_elements=["chat_id", "user_id", "date"],
+                            set_={
+                                "badwords_count": BadWords.badwords_count + swear_delta,
+                                "neutral_count": BadWords.neutral_count + neutral_delta,
+                                "username": username,
+                            },
+                        )
+                    )
+                if previous and (old_swears or old_neutral):
+                    await session.execute(
+                        delete(SwearLog).where(
+                            SwearLog.chat_id == chat_id,
+                            SwearLog.message_id == message_id,
+                        )
+                    )
+                for category, words in (("swear", swear_words), ("neutral", neutral_words)):
+                    session.add_all(
+                        [
+                            SwearLog(
+                                chat_id=chat_id,
+                                message_id=message_id,
+                                user_id=user_id,
+                                username=username,
+                                word=word[:MAX_DB_TEXT_LENGTH],
+                                category=category,
+                                timestamp=timestamp,
+                            )
+                            for word in words
+                        ]
+                    )
+                if previous:
+                    previous.version = version
+                    previous.update_id = update_id
+                    previous.swear_words = swear_words
+                    previous.neutral_words = neutral_words
+                else:
+                    session.add(
+                        ProcessedMessage(
+                            chat_id=chat_id,
+                            message_id=message_id,
+                            user_id=user_id,
+                            date=message_date,
+                            version=version,
+                            update_id=update_id,
+                            swear_words=swear_words,
+                            neutral_words=neutral_words,
+                        )
+                    )
+                await session.commit()
+                return True
+            except Exception as e:
+                await session.rollback()
+                raise RepositoryError("Could not record message") from e
+
+    @classmethod
+    async def get_all_for_period(cls, chat_id, start: date, end: date):
+        async with async_session_maker() as session:
+            try:
+                result = await session.execute(
+                    select(
+                        BadWords.user_id,
+                        func.max(BadWords.username).label("username"),
+                        func.sum(BadWords.badwords_count).label("badwords_count"),
+                        func.sum(BadWords.neutral_count).label("neutral_count"),
+                    )
+                    .where(
+                        BadWords.chat_id == chat_id,
+                        BadWords.date >= start,
+                        BadWords.date < end,
+                    )
+                    .group_by(BadWords.user_id)
+                )
+                return result.all()
+            except Exception as e:
+                raise RepositoryError("Could not load period statistics") from e
+
+    @classmethod
     async def ensure_daily_swears_integrity(cls):
         async with async_session_maker() as session:
             try:
+                await session.execute(text("SET LOCAL lock_timeout = '2s'"))
+                await session.execute(
+                    text("ALTER TABLE swear_logs ADD COLUMN IF NOT EXISTS message_id BIGINT")
+                )
                 await session.execute(
                     text(
                         """
@@ -121,7 +274,7 @@ class BadWordsRepository:
             except Exception as e:
                 await session.rollback()
                 logger.error(f"❌ Ошибка проверки целостности daily_swears: {e}")
-                raise
+                raise RepositoryError("Database operation failed") from e
 
     @classmethod
     async def increment_message_count(cls, chat_id, user_id, username, date):
@@ -171,6 +324,7 @@ class BadWordsRepository:
             except Exception as e:
                 await session.rollback()
                 logger.error(f"❌ Ошибка записи количества сообщений: {e}")
+                raise RepositoryError("Database operation failed") from e
 
     @classmethod
     async def add_swear(
@@ -261,7 +415,7 @@ class BadWordsRepository:
             except Exception as e:
                 await session.rollback()
                 logger.error(f"❌ Ошибка записи в БД: {e}")
-                raise
+                raise RepositoryError("Database operation failed") from e
 
     @classmethod
     async def get_swear_count(cls, chat_id, user_id, date):
@@ -283,7 +437,7 @@ class BadWordsRepository:
             except Exception as e:
                 await session.rollback()
                 logger.error(f"❌ Ошибка получения статистики: {e}")
-                return 0
+                raise RepositoryError("Database operation failed") from e
 
     @classmethod
     async def get_all_for_date(cls, chat_id, date):
@@ -308,7 +462,7 @@ class BadWordsRepository:
             except Exception as e:
                 await session.rollback()
                 logger.error(f"❌ Ошибка получения данных за дату: {e}")
-                return []
+                raise RepositoryError("Database operation failed") from e
 
     @classmethod
     async def get_all_for_month(cls, chat_id, year: int, month: int):
@@ -349,7 +503,7 @@ class BadWordsRepository:
             except Exception as e:
                 await session.rollback()
                 logger.error(f"❌ Ошибка получения месячных данных: {e}")
-                return []
+                raise RepositoryError("Database operation failed") from e
 
     @classmethod
     async def get_chat_month_summary(cls, chat_id, year: int, month: int):
@@ -408,13 +562,7 @@ class BadWordsRepository:
                 )
             except Exception as e:
                 logger.error(f"❌ Ошибка получения месячной сводки чата: {e}")
-                return SimpleNamespace(
-                    swear_count=0,
-                    neutral_count=0,
-                    favorite_word=None,
-                    max_day=None,
-                    max_day_swears=0,
-                )
+                raise RepositoryError("Database operation failed") from e
 
     @classmethod
     async def get_user_month_profile(cls, chat_id, user_id, year: int, month: int):
@@ -531,17 +679,7 @@ class BadWordsRepository:
                 )
             except Exception as e:
                 logger.error(f"❌ Ошибка получения матного профиля: {e}")
-                return SimpleNamespace(
-                    swear_count=0,
-                    neutral_count=0,
-                    daily_record=0,
-                    previous_swear_count=0,
-                    message_count=0,
-                    favorite_word=None,
-                    favorite_count=0,
-                    unique_swear_count=0,
-                    chat_swear_counts=[],
-                )
+                raise RepositoryError("Database operation failed") from e
 
     @classmethod
     async def mark_rare_word_discovered(
@@ -587,7 +725,7 @@ class BadWordsRepository:
             except Exception as e:
                 await session.rollback()
                 logger.error(f"❌ Ошибка сохранения редкой находки: {e}")
-                return False
+                raise RepositoryError("Database operation failed") from e
 
     @classmethod
     async def get_recent_logs(cls, chat_id, user_id, limit=30):
@@ -612,10 +750,11 @@ class BadWordsRepository:
                 return result.scalars().all()
             except Exception as e:
                 logger.error(f"❌ Ошибка получения логов: {e}")
-                return []
+                raise RepositoryError("Database operation failed") from e
 
     @classmethod
-    async def clear_old_logs(cls, days=7):
+    async def clear_old_logs(cls, days=90):
+        days = max(days, 90)
         async with async_session_maker() as session:
             try:
                 threshold_date = datetime.now(TZ_KYIV) - timedelta(days=days)
@@ -623,6 +762,9 @@ class BadWordsRepository:
                 stmt = delete(SwearLog).where(SwearLog.timestamp < threshold_date)
 
                 result = await session.execute(stmt)
+                await session.execute(
+                    delete(ProcessedMessage).where(ProcessedMessage.date < threshold_date.date())
+                )
                 await session.commit()
 
                 deleted_count = result.rowcount
@@ -633,24 +775,26 @@ class BadWordsRepository:
             except Exception as e:
                 await session.rollback()
                 logger.error(f"❌ Ошибка очистки логов: {e}")
+                raise RepositoryError("Database operation failed") from e
 
     @classmethod
     async def subscribe_chat(cls, chat_id: int) -> bool:
         async with async_session_maker() as session:
             try:
-                stmt = select(ReportChat).where(ReportChat.chat_id == chat_id)
+                stmt = (
+                    insert(ReportChat)
+                    .values(chat_id=chat_id)
+                    .on_conflict_do_nothing()
+                    .returning(ReportChat.chat_id)
+                )
                 result = await session.execute(stmt)
-                if result.scalar_one_or_none():
-                    return False
-
-                session.add(ReportChat(chat_id=chat_id))
+                created = result.scalar_one_or_none() is not None
                 await session.commit()
-                logger.info(f"✅ БД: Чат {chat_id} подписан на рассылку")
-                return True
+                return created
             except Exception as e:
                 await session.rollback()
                 logger.error(f"❌ Ошибка при подписке чата {chat_id}: {e}")
-                return False
+                raise RepositoryError("Database operation failed") from e
 
     @classmethod
     async def unsubscribe_chat(cls, chat_id: int) -> bool:
@@ -667,7 +811,7 @@ class BadWordsRepository:
             except Exception as e:
                 await session.rollback()
                 logger.error(f"❌ Ошибка при отписке чата {chat_id}: {e}")
-                return False
+                raise RepositoryError("Database operation failed") from e
 
     @classmethod
     async def get_all_active_chats(cls) -> list[int]:
@@ -678,34 +822,34 @@ class BadWordsRepository:
                 return list(result.scalars().all())
             except Exception as e:
                 logger.error(f"❌ Ошибка получения списка чатов: {e}")
-                return []
+                raise RepositoryError("Database operation failed") from e
 
     @classmethod
     async def upsert_bot_chat(cls, chat_id: int, title: str | None, chat_type: str) -> None:
         async with async_session_maker() as session:
             try:
-                stmt = select(BotChat).where(BotChat.chat_id == chat_id)
-                result = await session.execute(stmt)
-                chat = result.scalar_one_or_none()
-
-                if chat:
-                    chat.title = title
-                    chat.chat_type = chat_type
-                    chat.updated_at = datetime.now(TZ_KYIV)
-                else:
-                    session.add(
-                        BotChat(
-                            chat_id=chat_id,
-                            title=title,
-                            chat_type=chat_type,
-                            updated_at=datetime.now(TZ_KYIV),
-                        )
+                stmt = insert(BotChat).values(
+                    chat_id=chat_id,
+                    title=title,
+                    chat_type=chat_type,
+                    updated_at=datetime.now(TZ_KYIV),
+                )
+                await session.execute(
+                    stmt.on_conflict_do_update(
+                        index_elements=["chat_id"],
+                        set_={
+                            "title": stmt.excluded.title,
+                            "chat_type": stmt.excluded.chat_type,
+                            "updated_at": stmt.excluded.updated_at,
+                        },
                     )
+                )
 
                 await session.commit()
             except Exception as e:
                 await session.rollback()
                 logger.error(f"❌ Ошибка сохранения чата {chat_id}: {e}")
+                raise RepositoryError("Database operation failed") from e
 
     @classmethod
     async def get_all_bot_chats(cls) -> list[BotChat]:
@@ -716,4 +860,4 @@ class BadWordsRepository:
                 return list(result.scalars().all())
             except Exception as e:
                 logger.error(f"❌ Ошибка получения списка известных чатов: {e}")
-                return []
+                raise RepositoryError("Database operation failed") from e

@@ -17,4 +17,8 @@ RUN poetry install --no-root --no-ansi
 
 COPY . .
 
+ARG VCS_REF=""
+ARG VCS_DATE=""
+RUN python version_info.py --write --commit "$VCS_REF" --commit-date "$VCS_DATE"
+
 CMD ["python", "app.py"]

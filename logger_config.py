@@ -1,9 +1,12 @@
 import logging
 import os
 import sys
+import time
 import urllib.parse
 import urllib.request
+from collections import OrderedDict
 from pathlib import Path
+from threading import Lock
 
 import sentry_sdk
 from dotenv import load_dotenv
@@ -21,6 +24,35 @@ ADMIN_ID = os.getenv("ADMIN_ID")
 
 if SENTRY_DSN:
     sentry_sdk.init(dsn=SENTRY_DSN, traces_sample_rate=1.0)
+
+
+class AlertCooldown:
+    """Rate limit notifications only; stdout and file logs keep every error."""
+
+    def __init__(self, seconds=900, max_keys=256, clock=time.monotonic):
+        self.seconds = seconds
+        self.max_keys = max_keys
+        self.clock = clock
+        self.sent = OrderedDict()
+        self.lock = Lock()
+
+    def __call__(self, record):
+        message = record["message"]
+        key = (
+            "telegram_polling_conflict"
+            if "TelegramConflictError" in message
+            else (record["name"], record["function"], message[:200])
+        )
+        now = self.clock()
+        with self.lock:
+            previous = self.sent.get(key)
+            if previous is not None and now - previous < self.seconds:
+                return False
+            self.sent[key] = now
+            self.sent.move_to_end(key)
+            if len(self.sent) > self.max_keys:
+                self.sent.popitem(last=False)
+        return True
 
 
 def sentry_sink(message):
@@ -74,11 +106,12 @@ def setup_logging():
     logger.add(LOGS_DIR / "app.log", rotation="5 MB", level="INFO")
 
     if SENTRY_DSN:
-        logger.add(sentry_sink, level="ERROR", enqueue=True)
+        logger.add(sentry_sink, level="ERROR", enqueue=True, filter=AlertCooldown())
 
     logger.add(
         telegram_alert_sink,
         level="ERROR",
         format="{time:YYYY-MM-DD HH:mm:ss} | {name}:{function}:{line}\n{message}",
         enqueue=True,
+        filter=AlertCooldown(),
     )

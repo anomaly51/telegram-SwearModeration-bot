@@ -1,10 +1,11 @@
-import asyncio
 from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 
+from aiogram.exceptions import TelegramRetryAfter
 from loguru import logger
 
 from database.orm_query import TZ_KYIV, BadWordsRepository, get_previous_month
+from database.report_query import ReportRepository
 
 
 MEDALS = ("🥇", "🥈", "🥉")
@@ -133,71 +134,95 @@ def format_monthly_report(
     return "".join(text_parts)
 
 
-async def send_daily_report(bot):
+def format_weekly_report(records, start: date, end: date) -> str:
+    text = format_daily_report(records)
+    return text.replace(
+        "🏆 Матный рейтинг дня",
+        f"🏆 Матный рейтинг недели {start:%d.%m.%Y}–{end - timedelta(days=1):%d.%m.%Y}",
+    ).replace("Сегодня матов не было.", "За неделю матов не было.")
+
+
+def completed_periods(today: date) -> list[tuple[str, date, date]]:
+    monday = today - timedelta(days=today.weekday())
+    month_start = today.replace(day=1)
+    previous_month = (month_start - timedelta(days=1)).replace(day=1)
+    return [
+        ("daily", today - timedelta(days=1), today),
+        ("weekly", monday - timedelta(days=7), monday),
+        ("monthly", previous_month, month_start),
+    ]
+
+
+async def build_period_report(chat_id: int, kind: str, start: date, end: date) -> str:
+    records = await BadWordsRepository.get_all_for_period(chat_id, start, end)
+    if kind == "daily":
+        return (
+            format_daily_report(records)
+            .replace("Матный рейтинг дня", f"Матный рейтинг дня {start:%d.%m.%Y}")
+            .replace("Сегодня матов не было.", "За этот день матов не было.")
+        )
+    if kind == "weekly":
+        return format_weekly_report(records, start, end)
+    prev_year, prev_month = get_previous_month(start.year, start.month)
+    summary = await BadWordsRepository.get_chat_month_summary(chat_id, start.year, start.month)
+    previous = await BadWordsRepository.get_chat_month_summary(chat_id, prev_year, prev_month)
+    return format_monthly_report(records, start.year, start.month, summary, previous)
+
+
+async def deliver_report(bot, delivery) -> None:
+    for index in range(delivery.next_chunk, len(delivery.chunks)):
+        await bot.send_message(delivery.chat_id, delivery.chunks[index])
+        # Persist each successful part so retries resume a long report.
+        await ReportRepository.advance(
+            delivery.chat_id,
+            delivery.kind,
+            delivery.period_start,
+            index + 1,
+        )
+
+
+async def send_scheduled_reports(bot, now: datetime | None = None):
+    """Recover the latest closed periods and unfinished sends on every scheduler tick."""
+    now = now or datetime.now(TZ_KYIV)
+    today = (now.astimezone(TZ_KYIV) - timedelta(minutes=5)).date()
     try:
         active_chats = await BadWordsRepository.get_all_active_chats()
-
-        if not active_chats:
-            logger.info("ℹ️ Планировщик: Нет активных чатов для рассылки отчета.")
-            return
-
-        logger.info(f"🚀 Планировщик: Начинаю рассылку отчетов для {len(active_chats)} чатов.")
-
-        today = datetime.now(TZ_KYIV).date()
-        should_send_monthly_report = is_last_day_of_month(today)
-        monthly_reports = []
-
-        for chat_id in active_chats:
-            try:
-                records = await BadWordsRepository.get_all_for_date(chat_id=chat_id, date=today)
-
-                if not records:
-                    await _send_message(bot, chat_id, "📊 Сегодня ругательств не было. Молодцы!")
-                else:
-                    await _send_message(bot, chat_id, format_daily_report(records))
-                    await _send_message(
-                        bot, chat_id, "Молодцы, все хорошо постарались! Завтра надо больше 😈"
-                    )
-
-                if should_send_monthly_report:
-                    prev_year, prev_month = get_previous_month(today.year, today.month)
-                    month_records = await BadWordsRepository.get_all_for_month(
-                        chat_id=chat_id,
-                        year=today.year,
-                        month=today.month,
-                    )
-                    summary = await BadWordsRepository.get_chat_month_summary(
-                        chat_id=chat_id,
-                        year=today.year,
-                        month=today.month,
-                    )
-                    previous_summary = await BadWordsRepository.get_chat_month_summary(
-                        chat_id=chat_id,
-                        year=prev_year,
-                        month=prev_month,
-                    )
-                    monthly_reports.append(
-                        (
-                            chat_id,
-                            format_monthly_report(
-                                month_records,
-                                today.year,
-                                today.month,
-                                summary,
-                                previous_summary,
-                            ),
-                        )
-                    )
-            except Exception:
-                logger.exception(f"❌ Не удалось отправить отчет в чат {chat_id}")
-
-        if monthly_reports:
-            await asyncio.sleep(60)
-            for chat_id, report in monthly_reports:
-                try:
-                    await _send_message(bot, chat_id, report)
-                except Exception:
-                    logger.exception(f"❌ Не удалось отправить месячный отчет в чат {chat_id}")
-
     except Exception:
-        logger.exception("❌ Ошибка внутри планировщика отчетов")
+        logger.exception("Не удалось получить подписки; повторим рассылку через 5 минут")
+        return
+    for chat_id in active_chats:
+        try:
+            pending = await ReportRepository.pending(chat_id)
+        except Exception:
+            logger.exception(f"Не удалось получить очередь отчетов чата {chat_id}")
+            continue
+        periods = completed_periods(today)
+        tasks = [(row.kind, row.period_start, None, row) for row in pending]
+        pending_keys = {(row.kind, row.period_start) for row in pending}
+        tasks.extend(
+            (kind, start, end, None)
+            for kind, start, end in periods
+            if (kind, start) not in pending_keys
+        )
+        for kind, start, end, delivery in tasks:
+            try:
+                delivery = delivery or await ReportRepository.get(chat_id, kind, start)
+                if delivery is None:
+                    report = await build_period_report(chat_id, kind, start, end)
+                    delivery = await ReportRepository.prepare(
+                        chat_id,
+                        kind,
+                        start,
+                        split_telegram_message(report),
+                    )
+                await deliver_report(bot, delivery)
+            except TelegramRetryAfter as e:
+                logger.warning(f"Telegram ограничил рассылку на {e.retry_after} секунд")
+                # Leave progress intact; the next tick retries instead of losing the report.
+                return
+            except Exception:
+                logger.exception(f"Не удалось отправить {kind} отчет в чат {chat_id}")
+
+
+# Compatibility for existing callers; all scheduled periods now share durable delivery.
+send_daily_report = send_scheduled_reports

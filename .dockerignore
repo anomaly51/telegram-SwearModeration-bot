@@ -7,3 +7,8 @@ README.md
 .pre-commit-config.yaml
 .vscode/
 .venv
+.env
+.env.*
+.build-info.json
+logs/
+.pytest_cache/
